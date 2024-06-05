@@ -20,3 +20,5 @@ python train.py --image_size 128 --train_batch_size 64 --num_epochs 50 --learnin
 ```
 
 ## Results after 50 epoch
+
+![image](ddpm-butterflies-128/samples/0049.png)
