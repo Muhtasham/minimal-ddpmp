@@ -1,3 +1,4 @@
 diffusers[training]
+torchvision
 Pillow
 loguru

@@ -1,1 +1,13 @@
 venv/
+
+# Ignore everything in the ddpm-butterflies-128 folder
+ddpm-butterflies-128/*
+
+# Except the samples folder
+!ddpm-butterflies-128/samples/
+
+# But ignore everything inside the samples folder's subdirectories
+ddpm-butterflies-128/samples/*
+
+# Except actual files within the samples folder
+!ddpm-butterflies-128/samples/**

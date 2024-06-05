@@ -2,6 +2,7 @@ import math
 import os
 import torch
 import torch.nn.functional as F
+import argparse
 
 from dataclasses import dataclass, asdict
 from accelerate import Accelerator
@@ -17,7 +18,6 @@ from loguru import logger
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers import DDPMPipeline
 from accelerate import notebook_launcher
-import argparse
 from typing import Tuple, List, Dict, Optional
 from functools import partial
 
@@ -82,6 +82,8 @@ class DDPMPipelineTrainer:
         Args:
             dataset: The dataset to preprocess.
         """
+
+        # The images are all different sizes, so we'll need to preprocess them first
         preprocess = transforms.Compose(
             [
                 transforms.Resize((self.config.image_size, self.config.image_size)),
@@ -168,6 +170,7 @@ class DDPMPipelineTrainer:
             train_dataloader (torch.utils.data.DataLoader): The training dataloader.
             lr_scheduler: The learning rate scheduler.
         """
+        # Initialize accelerator and tensorboard logging
         accelerator = Accelerator(
             mixed_precision=config.mixed_precision,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -182,28 +185,37 @@ class DDPMPipelineTrainer:
                 os.makedirs(config.output_dir, exist_ok=True)
             accelerator.init_trackers("train_example")
 
+        # Prepare everything
+        # There is no specific order to remember, we just need to unpack the
+        # objects in the same order we gave them to the prepare method.
         model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dataloader, lr_scheduler
         )
 
         global_step = 0
 
+        # Now we train the model
         for epoch in range(config.num_epochs):
             progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
             progress_bar.set_description(f"Epoch {epoch}")
 
             for step, batch in enumerate(train_dataloader):
                 clean_images = batch["images"]
+                # Sample noise to add to the images
                 noise = torch.randn(clean_images.shape).to(clean_images.device)
                 bs = clean_images.shape[0]
 
+                # Sample a random timestep for each image
                 timesteps = torch.randint(
                     0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
                 ).long()
 
+                # Add noise to the clean images according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
                 noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
                 with accelerator.accumulate(model):
+                    # Predict the noise residual
                     noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
                     loss = F.mse_loss(noise_pred, noise)
                     accelerator.backward(loss)
@@ -218,7 +230,8 @@ class DDPMPipelineTrainer:
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
                 global_step += 1
-
+            
+            # After each epoch we optionally sample some demo images with evaluate() and save the model
             if accelerator.is_main_process:
                 pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
 
@@ -245,7 +258,8 @@ class DDPMPipelineTrainer:
 
         self.preprocess_dataset(dataset)
         logger.debug(dataset)
-
+        
+        #  wrap the dataset in a DataLoader for training 
         train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
 
         model = UNet2DModel(
@@ -280,9 +294,8 @@ class DDPMPipelineTrainer:
         noise = torch.randn(sample_image.shape)
         timesteps = torch.LongTensor([50])
         noisy_image = noise_scheduler.add_noise(sample_image, noise, timesteps)
-
-        Image.fromarray(((noisy_image.permute(0, 2, 3, 1) + 1.0) * 127.5).type(torch.uint8).numpy()[0])
-
+        
+        # The training objective of the model is to predict the noise added to the image. The loss at this step can be calculated by below
         noise_pred = model(noisy_image, timesteps).sample
         loss = F.mse_loss(noise_pred, noise)
 
