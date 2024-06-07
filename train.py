@@ -68,7 +68,7 @@ class DDPMPipelineTrainer:
         parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Learning rate warmup steps")
         parser.add_argument("--save_image_epochs", type=int, default=10, help="Save image every n epochs")
         parser.add_argument("--save_model_epochs", type=int, default=30, help="Save model every n epochs")
-        parser.add_argument("--mixed_precision", type=str, default="fp16", help="Choose from no, fp16, bf16 or fp8")
+        parser.add_argument("--mixed_precision", type=str, default="bf16", help="Choose from no, fp16, bf16 or fp8")
         parser.add_argument("--output_dir", type=str, default="ddpm-butterflies-128", help="Output directory")
         parser.add_argument("--push_to_hub", action='store_true', help="Upload the saved model to the HF Hub")
         parser.add_argument("--hub_private_repo", action='store_true', help="Make the HF Hub repo private")
@@ -189,7 +189,7 @@ class DDPMPipelineTrainer:
                 os.makedirs(config.output_dir, exist_ok=True)
             accelerator.init_trackers("train_example")
 
-        flop_counter = FlopCounterMode(model, display=True)
+        flop_counter = FlopCounterMode(display=True)
 
         # Prepare everything
         # There is no specific order to remember, we just need to unpack the
@@ -263,6 +263,7 @@ class DDPMPipelineTrainer:
                     }
                     progress_bar.set_postfix(**logs)
                     accelerator.log(logs, step=global_step)
+                    total_flops = flop_counter.get_total_flops()
                     global_step += 1
                 
                 print(flop_counter.get_table())
