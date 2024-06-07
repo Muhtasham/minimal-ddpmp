@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import argparse
 import time 
 
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 from dataclasses import dataclass
 from accelerate import Accelerator
 from huggingface_hub import HfFolder, Repository, whoami
@@ -62,7 +65,7 @@ class DDPMPipelineTrainer:
         parser.add_argument("--image_size", type=int, default=128, help="Generated image resolution")
         parser.add_argument("--train_batch_size", type=int, default=64, help="Training batch size")
         parser.add_argument("--eval_batch_size", type=int, default=64, help="Evaluation batch size")
-        parser.add_argument("--num_epochs", type=int, default=50, help="Number of epochs")
+        parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs")
         parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
         parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
         parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Learning rate warmup steps")
@@ -74,7 +77,7 @@ class DDPMPipelineTrainer:
         parser.add_argument("--hub_private_repo", action='store_true', help="Make the HF Hub repo private")
         parser.add_argument("--overwrite_output_dir", action='store_true', help="Overwrite the old model")
         parser.add_argument("--seed", type=int, default=0, help="Random seed")
-        parser.add_argument("--eval", type=bool, default=True)
+        parser.add_argument("--eval", type=bool, default=False)
         parser.add_argument("--optim", type=bool, default=False)
 
         return parser.parse_args()
@@ -199,7 +202,9 @@ class DDPMPipelineTrainer:
         )
 
         global_step = 0
-        
+        total_step_time = 0.0  # Initialize the variable to accumulate step times
+        previous_flops = None
+
         """
         prof = torch.profiler.profile(
             activities=[
@@ -220,7 +225,6 @@ class DDPMPipelineTrainer:
             for epoch in range(config.num_epochs):
                 progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
                 progress_bar.set_description(f"Epoch {epoch}")
-                total_step_time = 0.0  # Initialize the variable to accumulate step times
 
                 #prof.start()
                 for step, batch in enumerate(train_dataloader):
@@ -255,18 +259,29 @@ class DDPMPipelineTrainer:
                     step_time = time.time() - start_time  # Calculate step duration
                     total_step_time += step_time  # Accumulate step time
                     progress_bar.update(1)
+
+                    total_flops = flop_counter.get_total_flops()
+
+                    # Calculate percentage increase in FLOPs
+                    if previous_flops is not None:
+                        flops_increase = ((total_flops - previous_flops) / previous_flops) * 100
+                    else:
+                        flops_increase = 0  # No increase for the first step
+
+                    # Update the previous FLOPs
+                    previous_flops = total_flops
+                    
                     logs = {
                         "loss": loss.detach().item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "step": global_step,
-                        "step_time": f"{step_time:.4f} seconds"
+                        "step_time": f"{step_time:.4f} seconds",       
+                        "total_flops": total_flops,
+                        "flops_increase": f"{flops_increase:.2f}%"
                     }
                     progress_bar.set_postfix(**logs)
                     accelerator.log(logs, step=global_step)
-                    total_flops = flop_counter.get_total_flops()
                     global_step += 1
-                
-                print(flop_counter.get_table())
 
                 # Calculate and log the average step time at the end of the epoch
                 avg_step_time = total_step_time / len(train_dataloader)
@@ -288,6 +303,7 @@ class DDPMPipelineTrainer:
                                 pipeline.save_pretrained(config.output_dir)
             #prof.stop()
 
+        #print(flop_counter.get_table())
         #print(prof.key_averages(group_by_stack_n=1).table(sort_by="self_cuda_time_total", row_limit=1))
         #logger.info("exporting profile")
         #prof.export_chrome_trace("trace.json")
@@ -336,7 +352,7 @@ class DDPMPipelineTrainer:
         
         if config.optim:
             start_compile_time = time.time()  # Record start time
-            # model = torch.compile(model, mode="reduce-overhead", fullgraph=True) 
+            model = torch.compile(model, mode="reduce-overhead", fullgraph=True) # Default compile no increase
             compile_time = time.time() - start_compile_time  # Calculate compilation duration
             logger.info(f"Model torch compiled in {compile_time:.4f} seconds")
 
