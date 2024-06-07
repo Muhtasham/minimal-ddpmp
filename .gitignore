@@ -1,4 +1,6 @@
 venv/
+log/
+trace.json
 
 # Ignore everything in the ddpm-butterflies-128 folder
 ddpm-butterflies-128/*
