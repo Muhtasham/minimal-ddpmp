@@ -1,28 +1,25 @@
-import math
 import os
 import torch
 import torch.nn.functional as F
 import argparse
 import time 
-import logging
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from accelerate import Accelerator
 from huggingface_hub import HfFolder, Repository, whoami
 from tqdm.auto import tqdm
 from pathlib import Path
 from torchvision import transforms
 from datasets import load_dataset
-from PIL import Image, ExifTags
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from diffusers import DDIMPipeline, DDIMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
 from accelerate import notebook_launcher
-from typing import Tuple, List, Dict, Optional
-from functools import partial
+from typing import List, Dict, Optional
 from torch.utils.flop_counter import FlopCounterMode
-from torch.profiler import profile, record_function, ProfilerActivity
+from PIL import Image
 from rich import print
 from loguru import logger
+from functools import partial
 
 @dataclass
 class TrainingConfig:
@@ -42,11 +39,12 @@ class TrainingConfig:
     overwrite_output_dir: bool = True
     seed: int = 0
     eval: bool = False
+    optim: bool = False
 
-class DDIMPipelineTrainer:
+class DDPMPipelineTrainer:
     def __init__(self, config: TrainingConfig):
         """
-        Initializes the DDIMPipelineTrainer with the given configuration.
+        Initializes the DDPMPipelineTrainer with the given configuration.
 
         Args:
             config (TrainingConfig): The configuration for training.
@@ -64,19 +62,20 @@ class DDIMPipelineTrainer:
         parser.add_argument("--image_size", type=int, default=128, help="Generated image resolution")
         parser.add_argument("--train_batch_size", type=int, default=64, help="Training batch size")
         parser.add_argument("--eval_batch_size", type=int, default=64, help="Evaluation batch size")
-        parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs")
+        parser.add_argument("--num_epochs", type=int, default=50, help="Number of epochs")
         parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
         parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
         parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Learning rate warmup steps")
         parser.add_argument("--save_image_epochs", type=int, default=10, help="Save image every n epochs")
         parser.add_argument("--save_model_epochs", type=int, default=30, help="Save model every n epochs")
-        parser.add_argument("--mixed_precision", type=str, default="fp16", help="Mixed precision (no, fp16)")
+        parser.add_argument("--mixed_precision", type=str, default="fp16", help="Choose from no, fp16, bf16 or fp8")
         parser.add_argument("--output_dir", type=str, default="ddpm-butterflies-128", help="Output directory")
         parser.add_argument("--push_to_hub", action='store_true', help="Upload the saved model to the HF Hub")
         parser.add_argument("--hub_private_repo", action='store_true', help="Make the HF Hub repo private")
         parser.add_argument("--overwrite_output_dir", action='store_true', help="Overwrite the old model")
         parser.add_argument("--seed", type=int, default=0, help="Random seed")
         parser.add_argument("--eval", type=bool, default=True)
+        parser.add_argument("--optim", type=bool, default=False)
 
         return parser.parse_args()
 
@@ -123,13 +122,13 @@ class DDIMPipelineTrainer:
             grid.paste(image, box=(i % cols * w, i // cols * h))
         return grid
 
-    def evaluate(self, epoch: int, pipeline: DDIMPipeline) -> None:
+    def evaluate(self, epoch: int, pipeline: DDPMPipeline) -> None:
         """
         Evaluates the model by generating and saving sample images.
 
         Args:
             epoch (int): Current epoch number.
-            pipeline (DDIMPipeline): The DDPM pipeline for image generation.
+            pipeline (DDPMPipeline): The DDPM pipeline for image generation.
         """
         images = pipeline(
             batch_size=self.config.eval_batch_size,
@@ -163,14 +162,14 @@ class DDIMPipelineTrainer:
         else:
             return f"{organization}/{model_id}"
 
-    def train_loop(self, config: TrainingConfig, model: UNet2DModel, noise_scheduler: DDIMScheduler, optimizer: torch.optim.Optimizer, train_dataloader: torch.utils.data.DataLoader, lr_scheduler) -> None:
+    def train_loop(self, config: TrainingConfig, model: UNet2DModel, noise_scheduler: DDPMScheduler, optimizer: torch.optim.Optimizer, train_dataloader: torch.utils.data.DataLoader, lr_scheduler) -> None:
         """
         The main training loop.
 
         Args:
             config (TrainingConfig): The configuration for training.
             model (UNet2DModel): The model to train.
-            noise_scheduler (DDIMScheduler): The noise scheduler.
+            noise_scheduler (DDPMScheduler): The noise scheduler.
             optimizer (torch.optim.Optimizer): The optimizer.
             train_dataloader (torch.utils.data.DataLoader): The training dataloader.
             lr_scheduler: The learning rate scheduler.
@@ -190,7 +189,7 @@ class DDIMPipelineTrainer:
                 os.makedirs(config.output_dir, exist_ok=True)
             accelerator.init_trackers("train_example")
 
-        flop_counter = FlopCounterMode(model, depth=1, display=True)
+        flop_counter = FlopCounterMode(model, display=True)
 
         # Prepare everything
         # There is no specific order to remember, we just need to unpack the
@@ -216,75 +215,78 @@ class DDIMPipelineTrainer:
         )
         """
 
-        # Now we train the model
-        for epoch in range(config.num_epochs):
-            progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
-            progress_bar.set_description(f"Epoch {epoch}")
-            total_step_time = 0.0  # Initialize the variable to accumulate step times
+        with flop_counter: 
+            # Now we train the model
+            for epoch in range(config.num_epochs):
+                progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
+                progress_bar.set_description(f"Epoch {epoch}")
+                total_step_time = 0.0  # Initialize the variable to accumulate step times
 
-            #prof.start()
-            for step, batch in enumerate(train_dataloader):
-                start_time = time.time()  # Record start time
+                #prof.start()
+                for step, batch in enumerate(train_dataloader):
+                    start_time = time.time()  # Record start time
 
-                #prof.step()
-                clean_images = batch["images"]
-                # Sample noise to add to the images
-                noise = torch.randn(clean_images.shape).to(clean_images.device)
-                bs = clean_images.shape[0]
+                    #prof.step()
+                    clean_images = batch["images"]
+                    # Sample noise to add to the images
+                    noise = torch.randn(clean_images.shape).to(clean_images.device)
+                    bs = clean_images.shape[0]
 
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
-                ).long()
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
+                    ).long()
 
-                # Add noise to the clean images according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+                    # Add noise to the clean images according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
-                with accelerator.accumulate(model):
-                    # Predict the noise residual
-                    noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
-                    loss = F.mse_loss(noise_pred, noise)
-                    accelerator.backward(loss)
+                    with accelerator.accumulate(model):
+                        # Predict the noise residual
+                        noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+                        loss = F.mse_loss(noise_pred, noise)
+                        accelerator.backward(loss)
 
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
+                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
+                    
+                    step_time = time.time() - start_time  # Calculate step duration
+                    total_step_time += step_time  # Accumulate step time
+                    progress_bar.update(1)
+                    logs = {
+                        "loss": loss.detach().item(),
+                        "lr": lr_scheduler.get_last_lr()[0],
+                        "step": global_step,
+                        "step_time": f"{step_time:.4f} seconds"
+                    }
+                    progress_bar.set_postfix(**logs)
+                    accelerator.log(logs, step=global_step)
+                    global_step += 1
                 
-                step_time = time.time() - start_time  # Calculate step duration
-                total_step_time += step_time  # Accumulate step time
-                progress_bar.update(1)
-                logs = {
-                    "loss": loss.detach().item(),
-                    "lr": lr_scheduler.get_last_lr()[0],
-                    "step": global_step,
-                    "step_time": f"{step_time:.4f} seconds"
-                }
-                progress_bar.set_postfix(**logs)
-                accelerator.log(logs, step=global_step)
-                global_step += 1
-            
-            # Calculate and log the average step time at the end of the epoch
-            avg_step_time = total_step_time / len(train_dataloader)
-            logger.info(f"Epoch {epoch} - Average step time: {avg_step_time:.4f} seconds")
+                print(flop_counter.get_table())
 
-            if config.eval:
-                # After each epoch we optionally sample some demo images with evaluate() and save the model
-                if accelerator.is_main_process:
-                    pipeline = DDIMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
+                # Calculate and log the average step time at the end of the epoch
+                avg_step_time = total_step_time / len(train_dataloader)
+                logger.info(f"Epoch {epoch} - Average step time: {avg_step_time:.4f} seconds")
 
-                    if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                        self.evaluate(epoch, pipeline)
+                if config.eval:
+                    logger.info("running eval")
+                    # After each epoch we optionally sample some demo images with evaluate() and save the model
+                    if accelerator.is_main_process:
+                        pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
 
-                    if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                        if config.push_to_hub:
-                            repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=True)
-                        else:
-                            pipeline.save_pretrained(config.output_dir)
+                        if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
+                            self.evaluate(epoch, pipeline)
+
+                        if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
+                            if config.push_to_hub:
+                                repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=True)
+                            else:
+                                pipeline.save_pretrained(config.output_dir)
             #prof.stop()
 
-        #print(flop_counter.get_table())
         #print(prof.key_averages(group_by_stack_n=1).table(sort_by="self_cuda_time_total", row_limit=1))
         #logger.info("exporting profile")
         #prof.export_chrome_trace("trace.json")
@@ -331,13 +333,13 @@ class DDIMPipelineTrainer:
             ),
         )
         
-        if config.eval:
+        if config.optim:
             start_compile_time = time.time()  # Record start time
-            model = torch.compile(model, mode="max-autotune", fullgraph=True) 
+            # model = torch.compile(model, mode="reduce-overhead", fullgraph=True) 
             compile_time = time.time() - start_compile_time  # Calculate compilation duration
             logger.info(f"Model torch compiled in {compile_time:.4f} seconds")
 
-        noise_scheduler = DDIMScheduler(num_train_timesteps=1000, rescale_betas_zero_snr=True, timestep_spacing="trailing")
+        noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
         
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
         lr_scheduler = get_cosine_schedule_with_warmup(
@@ -350,5 +352,5 @@ class DDIMPipelineTrainer:
         notebook_launcher(train_func, num_processes=1)
 
 if __name__ == "__main__":
-    trainer = DDIMPipelineTrainer(TrainingConfig())
+    trainer = DDPMPipelineTrainer(TrainingConfig())
     trainer.run()

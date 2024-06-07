@@ -4,3 +4,4 @@ Pillow
 loguru
 rich
 tabulate
+ruff
