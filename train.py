@@ -3,6 +3,8 @@ import os
 import torch
 import torch.nn.functional as F
 import argparse
+import time 
+import logging
 
 from dataclasses import dataclass, asdict
 from accelerate import Accelerator
@@ -11,18 +13,16 @@ from tqdm.auto import tqdm
 from pathlib import Path
 from torchvision import transforms
 from datasets import load_dataset
-from diffusers import UNet2DModel
 from PIL import Image, ExifTags
-from diffusers import DDPMScheduler
-from loguru import logger
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from diffusers import DDPMPipeline
+from diffusers import DDIMPipeline, DDIMScheduler, UNet2DModel
 from accelerate import notebook_launcher
 from typing import Tuple, List, Dict, Optional
 from functools import partial
 from torch.utils.flop_counter import FlopCounterMode
 from torch.profiler import profile, record_function, ProfilerActivity
-from rich import print 
+from rich import print
+from loguru import logger
 
 @dataclass
 class TrainingConfig:
@@ -41,11 +41,12 @@ class TrainingConfig:
     hub_private_repo: bool = False
     overwrite_output_dir: bool = True
     seed: int = 0
+    eval: bool = False
 
-class DDPMPipelineTrainer:
+class DDIMPipelineTrainer:
     def __init__(self, config: TrainingConfig):
         """
-        Initializes the DDPMPipelineTrainer with the given configuration.
+        Initializes the DDIMPipelineTrainer with the given configuration.
 
         Args:
             config (TrainingConfig): The configuration for training.
@@ -75,6 +76,7 @@ class DDPMPipelineTrainer:
         parser.add_argument("--hub_private_repo", action='store_true', help="Make the HF Hub repo private")
         parser.add_argument("--overwrite_output_dir", action='store_true', help="Overwrite the old model")
         parser.add_argument("--seed", type=int, default=0, help="Random seed")
+        parser.add_argument("--eval", type=bool, default=True)
 
         return parser.parse_args()
 
@@ -121,13 +123,13 @@ class DDPMPipelineTrainer:
             grid.paste(image, box=(i % cols * w, i // cols * h))
         return grid
 
-    def evaluate(self, epoch: int, pipeline: DDPMPipeline) -> None:
+    def evaluate(self, epoch: int, pipeline: DDIMPipeline) -> None:
         """
         Evaluates the model by generating and saving sample images.
 
         Args:
             epoch (int): Current epoch number.
-            pipeline (DDPMPipeline): The DDPM pipeline for image generation.
+            pipeline (DDIMPipeline): The DDPM pipeline for image generation.
         """
         images = pipeline(
             batch_size=self.config.eval_batch_size,
@@ -161,14 +163,14 @@ class DDPMPipelineTrainer:
         else:
             return f"{organization}/{model_id}"
 
-    def train_loop(self, config: TrainingConfig, model: UNet2DModel, noise_scheduler: DDPMScheduler, optimizer: torch.optim.Optimizer, train_dataloader: torch.utils.data.DataLoader, lr_scheduler) -> None:
+    def train_loop(self, config: TrainingConfig, model: UNet2DModel, noise_scheduler: DDIMScheduler, optimizer: torch.optim.Optimizer, train_dataloader: torch.utils.data.DataLoader, lr_scheduler) -> None:
         """
         The main training loop.
 
         Args:
             config (TrainingConfig): The configuration for training.
             model (UNet2DModel): The model to train.
-            noise_scheduler (DDPMScheduler): The noise scheduler.
+            noise_scheduler (DDIMScheduler): The noise scheduler.
             optimizer (torch.optim.Optimizer): The optimizer.
             train_dataloader (torch.utils.data.DataLoader): The training dataloader.
             lr_scheduler: The learning rate scheduler.
@@ -199,63 +201,81 @@ class DDPMPipelineTrainer:
 
         global_step = 0
         
-        with torch.profiler.profile(
+        """
+        prof = torch.profiler.profile(
             activities=[
                 #torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             #on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/unet2d'),
             record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
+            #profile_memory=True,
+            #with_stack=True,
             with_flops=True,
-            with_modules=True,
-        ) as prof:        
-            # Now we train the model
-            for epoch in range(config.num_epochs):
-                progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
-                progress_bar.set_description(f"Epoch {epoch}")
-                #prof.start()
-                for step, batch in enumerate(train_dataloader):
-                    #prof.step()
-                    clean_images = batch["images"]
-                    # Sample noise to add to the images
-                    noise = torch.randn(clean_images.shape).to(clean_images.device)
-                    bs = clean_images.shape[0]
+            #with_modules=True,
+        )
+        """
 
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(
-                        0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
-                    ).long()
+        # Now we train the model
+        for epoch in range(config.num_epochs):
+            progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
+            progress_bar.set_description(f"Epoch {epoch}")
+            total_step_time = 0.0  # Initialize the variable to accumulate step times
 
-                    # Add noise to the clean images according to the noise magnitude at each timestep
-                    # (this is the forward diffusion process)
-                    noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+            #prof.start()
+            for step, batch in enumerate(train_dataloader):
+                start_time = time.time()  # Record start time
 
-                    with accelerator.accumulate(model):
-                        # Predict the noise residual
-                        noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
-                        loss = F.mse_loss(noise_pred, noise)
-                        accelerator.backward(loss)
+                #prof.step()
+                clean_images = batch["images"]
+                # Sample noise to add to the images
+                noise = torch.randn(clean_images.shape).to(clean_images.device)
+                bs = clean_images.shape[0]
 
-                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
-                        lr_scheduler.step()
-                        optimizer.zero_grad()
+                # Sample a random timestep for each image
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
+                ).long()
 
-                    progress_bar.update(1)
-                    logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
-                    progress_bar.set_postfix(**logs)
-                    accelerator.log(logs, step=global_step)
-                    global_step += 1
+                # Add noise to the clean images according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+
+                with accelerator.accumulate(model):
+                    # Predict the noise residual
+                    noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+                    loss = F.mse_loss(noise_pred, noise)
+                    accelerator.backward(loss)
+
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
                 
+                step_time = time.time() - start_time  # Calculate step duration
+                total_step_time += step_time  # Accumulate step time
+                progress_bar.update(1)
+                logs = {
+                    "loss": loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "step": global_step,
+                    "step_time": f"{step_time:.4f} seconds"
+                }
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+                global_step += 1
+            
+            # Calculate and log the average step time at the end of the epoch
+            avg_step_time = total_step_time / len(train_dataloader)
+            logger.info(f"Epoch {epoch} - Average step time: {avg_step_time:.4f} seconds")
+
+            if config.eval:
                 # After each epoch we optionally sample some demo images with evaluate() and save the model
                 if accelerator.is_main_process:
-                    pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
+                    pipeline = DDIMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
 
                     if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                        #self.evaluate(epoch, pipeline)
-                        logger.info("skipping eval")
+                        self.evaluate(epoch, pipeline)
 
                     if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
                         if config.push_to_hub:
@@ -265,10 +285,9 @@ class DDPMPipelineTrainer:
             #prof.stop()
 
         #print(flop_counter.get_table())
-        #print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=5))
-        #print(prof.key_averages())
-        logger.info("exporting profile")
-        prof.export_chrome_trace("trace.json")
+        #print(prof.key_averages(group_by_stack_n=1).table(sort_by="self_cuda_time_total", row_limit=1))
+        #logger.info("exporting profile")
+        #prof.export_chrome_trace("trace.json")
 
     def run(self) -> None:
         """
@@ -312,22 +331,14 @@ class DDPMPipelineTrainer:
             ),
         )
         
-        #model = torch.compile(model)
-        #logger.info("model torch compiled")
+        if config.eval:
+            start_compile_time = time.time()  # Record start time
+            model = torch.compile(model, mode="max-autotune", fullgraph=True) 
+            compile_time = time.time() - start_compile_time  # Calculate compilation duration
+            logger.info(f"Model torch compiled in {compile_time:.4f} seconds")
 
-        sample_image = dataset[0]["images"].unsqueeze(0)
-        logger.debug("Input shape:", sample_image.shape)
-        logger.debug("Output shape:", model(sample_image, timestep=0).sample.shape)
-
-        noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
-        noise = torch.randn(sample_image.shape)
-        timesteps = torch.LongTensor([50])
-        noisy_image = noise_scheduler.add_noise(sample_image, noise, timesteps)
+        noise_scheduler = DDIMScheduler(num_train_timesteps=1000, rescale_betas_zero_snr=True, timestep_spacing="trailing")
         
-        # The training objective of the model is to predict the noise added to the image. The loss at this step can be calculated by below
-        noise_pred = model(noisy_image, timesteps).sample
-        loss = F.mse_loss(noise_pred, noise)
-
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
         lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
@@ -339,5 +350,5 @@ class DDPMPipelineTrainer:
         notebook_launcher(train_func, num_processes=1)
 
 if __name__ == "__main__":
-    trainer = DDPMPipelineTrainer(TrainingConfig())
+    trainer = DDIMPipelineTrainer(TrainingConfig())
     trainer.run()
