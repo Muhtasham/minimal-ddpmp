@@ -65,7 +65,7 @@ class DDPMPipelineTrainer:
         parser.add_argument("--image_size", type=int, default=128, help="Generated image resolution")
         parser.add_argument("--train_batch_size", type=int, default=64, help="Training batch size")
         parser.add_argument("--eval_batch_size", type=int, default=64, help="Evaluation batch size")
-        parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs")
+        parser.add_argument("--num_epochs", type=int, default=50, help="Number of epochs")
         parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
         parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
         parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Learning rate warmup steps")
@@ -77,7 +77,7 @@ class DDPMPipelineTrainer:
         parser.add_argument("--hub_private_repo", action='store_true', help="Make the HF Hub repo private")
         parser.add_argument("--overwrite_output_dir", action='store_true', help="Overwrite the old model")
         parser.add_argument("--seed", type=int, default=0, help="Random seed")
-        parser.add_argument("--eval", type=bool, default=False)
+        parser.add_argument("--eval", type=bool, default=True)
         parser.add_argument("--optim", type=bool, default=False)
 
         return parser.parse_args()
@@ -220,87 +220,93 @@ class DDPMPipelineTrainer:
         )
         """
 
-        with flop_counter: 
-            # Now we train the model
-            for epoch in range(config.num_epochs):
-                progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
-                progress_bar.set_description(f"Epoch {epoch}")
+        # with flop_counter: to avoid torch.compile errors
+        # Now we train the model
+        for epoch in range(config.num_epochs):
+            progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
+            progress_bar.set_description(f"Epoch {epoch}")
 
-                #prof.start()
-                for step, batch in enumerate(train_dataloader):
-                    start_time = time.time()  # Record start time
+            #prof.start()
+            for step, batch in enumerate(train_dataloader):
+                start_time = time.time()  # Record start time
 
-                    #prof.step()
-                    clean_images = batch["images"]
-                    # Sample noise to add to the images
-                    noise = torch.randn(clean_images.shape).to(clean_images.device)
-                    bs = clean_images.shape[0]
+                #prof.step()
+                clean_images = batch["images"]
+                # Sample noise to add to the images
+                noise = torch.randn(clean_images.shape).to(clean_images.device)
+                bs = clean_images.shape[0]
 
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(
-                        0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
-                    ).long()
+                # Sample a random timestep for each image
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
+                ).long()
 
-                    # Add noise to the clean images according to the noise magnitude at each timestep
-                    # (this is the forward diffusion process)
-                    noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+                # Add noise to the clean images according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
-                    with accelerator.accumulate(model):
-                        # Predict the noise residual
-                        noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
-                        loss = F.mse_loss(noise_pred, noise)
-                        accelerator.backward(loss)
+                with accelerator.accumulate(model):
+                    # Predict the noise residual
+                    noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+                    loss = F.mse_loss(noise_pred, noise)
+                    accelerator.backward(loss)
 
-                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
-                        lr_scheduler.step()
-                        optimizer.zero_grad()
-                    
-                    step_time = time.time() - start_time  # Calculate step duration
-                    total_step_time += step_time  # Accumulate step time
-                    progress_bar.update(1)
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+                
+                step_time = time.time() - start_time  # Calculate step duration
+                total_step_time += step_time  # Accumulate step time
+                if step == 0:
+                    logger.debug(f"first_step_time: {step_time}")
+                progress_bar.update(1)
 
-                    total_flops = flop_counter.get_total_flops()
+                """
+                total_flops = flop_counter.get_total_flops()
 
-                    # Calculate percentage increase in FLOPs
-                    if previous_flops is not None:
-                        flops_increase = ((total_flops - previous_flops) / previous_flops) * 100
-                    else:
-                        flops_increase = 0  # No increase for the first step
+                # Calculate percentage increase in FLOPs
+                if previous_flops is not None:
+                    flops_increase = ((total_flops - previous_flops) / previous_flops) * 100
+                else:
+                    flops_increase = 0  # No increase for the first step
+                
+                # Update the previous FLOPs
+                previous_flops = total_flops
+                """
 
-                    # Update the previous FLOPs
-                    previous_flops = total_flops
-                    
-                    logs = {
-                        "loss": loss.detach().item(),
-                        "lr": lr_scheduler.get_last_lr()[0],
-                        "step": global_step,
-                        "step_time": f"{step_time:.4f} seconds",       
-                        "total_flops": total_flops,
-                        "flops_increase": f"{flops_increase:.2f}%"
-                    }
-                    progress_bar.set_postfix(**logs)
-                    accelerator.log(logs, step=global_step)
-                    global_step += 1
+                
+                logs = {
+                    "loss": loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "step": global_step,
+                    "step_time": f"{step_time:.4f} seconds",       
+                    #"total_flops": total_flops,
+                    #"flops_increase": f"{flops_increase:.2f}%"
+                }
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+                #logger.info(f"total_flops: {total_flops} at step {step}, flops_increase: {flops_increase}%")
+                global_step += 1
 
-                # Calculate and log the average step time at the end of the epoch
-                avg_step_time = total_step_time / len(train_dataloader)
-                logger.info(f"Epoch {epoch} - Average step time: {avg_step_time:.4f} seconds")
+            # Calculate and log the average step time at the end of the epoch
+            avg_step_time = total_step_time / len(train_dataloader)
+            logger.info(f"Epoch {epoch} - Average step time: {avg_step_time:.4f} seconds")
 
-                if config.eval:
-                    logger.info("running eval")
-                    # After each epoch we optionally sample some demo images with evaluate() and save the model
-                    if accelerator.is_main_process:
-                        pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
+            if config.eval:
+                logger.info("running eval")
+                # After each epoch we optionally sample some demo images with evaluate() and save the model
+                if accelerator.is_main_process:
+                    pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
 
-                        if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                            self.evaluate(epoch, pipeline)
+                    if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
+                        self.evaluate(epoch, pipeline)
 
-                        if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                            if config.push_to_hub:
-                                repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=True)
-                            else:
-                                pipeline.save_pretrained(config.output_dir)
+                    if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
+                        if config.push_to_hub:
+                            repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=True)
+                        else:
+                            pipeline.save_pretrained(config.output_dir)
             #prof.stop()
 
         #print(flop_counter.get_table())
@@ -352,7 +358,7 @@ class DDPMPipelineTrainer:
         
         if config.optim:
             start_compile_time = time.time()  # Record start time
-            model = torch.compile(model, mode="reduce-overhead", fullgraph=True) # Default compile no increase
+            model = torch.compile(model) # Default compile no increase
             compile_time = time.time() - start_compile_time  # Calculate compilation duration
             logger.info(f"Model torch compiled in {compile_time:.4f} seconds")
 
