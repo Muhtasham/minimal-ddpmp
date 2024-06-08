@@ -18,6 +18,7 @@ from typing import List, Dict, Optional
 from PIL import Image
 from loguru import logger
 from functools import partial
+from torch.utils.flop_counter import FlopCounterMode
 
 @dataclass
 class TrainingConfig:
@@ -30,7 +31,7 @@ class TrainingConfig:
     lr_warmup_steps: int = 500
     save_image_epochs: int = 10
     save_model_epochs: int = 30
-    mixed_precision: str = "fp16"
+    mixed_precision: str = "bf16"
     output_dir: str = "ddpm-butterflies-128"
     push_to_hub: bool = False
     hub_private_repo: bool = False
@@ -46,8 +47,8 @@ class DDPMPipelineTrainer:
     def parse_args(self) -> argparse.Namespace:
         parser = argparse.ArgumentParser(description="Training script for DDPM")
         parser.add_argument("--image_size", type=int, default=128, help="Generated image resolution")
-        parser.add_argument("--train_batch_size", type=int, default=1, help="Training batch size")
-        parser.add_argument("--eval_batch_size", type=int, default=1, help="Evaluation batch size")
+        parser.add_argument("--train_batch_size", type=int, default=2, help="Training batch size")
+        parser.add_argument("--eval_batch_size", type=int, default=2, help="Evaluation batch size")
         parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs")
         parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
         parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
@@ -60,7 +61,7 @@ class DDPMPipelineTrainer:
         parser.add_argument("--hub_private_repo", action='store_true', help="Make the HF Hub repo private")
         parser.add_argument("--overwrite_output_dir", action='store_true', help="Overwrite the old model")
         parser.add_argument("--seed", type=int, default=0, help="Random seed")
-        parser.add_argument("--eval", type=bool, default=True)
+        parser.add_argument("--eval", type=bool, default=False)
         parser.add_argument("--optim", type=bool, default=False)
 
         return parser.parse_args()
@@ -78,7 +79,7 @@ class DDPMPipelineTrainer:
             return {"images": images}
 
         dataset.set_transform(transform)
-        logger.info("pre-processing done")
+        logger.info("Pre-processing done")
 
     def make_grid(self, images: List[Image.Image], rows: int, cols: int) -> Image.Image:
         w, h = images[0].size
@@ -109,6 +110,17 @@ class DDPMPipelineTrainer:
         else:
             return f"{organization}/{model_id}"
 
+    def estimate_mfu(self, total_flops, steps, avg_step_time): 
+        """ Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """ 
+
+        flops_per_iter = total_flops // steps
+        
+        # Express our flops throughput as ratio of A100 bfloat16 peak flops 
+        flops_achieved = flops_per_iter * (1.0 / avg_step_time)  # per second 
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS 
+        mfu = flops_achieved / flops_promised 
+        return mfu
+
     def train_loop(self, config: TrainingConfig, model: Transformer2DModel, noise_scheduler: DDPMScheduler, optimizer: torch.optim.Optimizer, train_dataloader: torch.utils.data.DataLoader, lr_scheduler) -> None:
         accelerator = Accelerator(
             mixed_precision=config.mixed_precision,
@@ -131,69 +143,71 @@ class DDPMPipelineTrainer:
 
         global_step = 0
         total_step_time = 0.0
+        flop_counter = FlopCounterMode(display=True)
 
-        for epoch in range(config.num_epochs):
-            progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
-            progress_bar.set_description(f"Epoch {epoch}")
+        with flop_counter:
+            for epoch in range(config.num_epochs):
+                progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
+                progress_bar.set_description(f"Epoch {epoch}")
 
-            for step, batch in enumerate(train_dataloader):
-                start_time = time.time()
-                clean_images = batch["images"].to(accelerator.device)
-                #print(f"clean_images: {clean_images}")
+                for step, batch in enumerate(train_dataloader):
+                    start_time = time.time()
+                    clean_images = batch["images"].to(accelerator.device)
 
-                noise = torch.randn(clean_images.shape).to(clean_images.device)
-                bs = clean_images.shape[0]
+                    noise = torch.randn(clean_images.shape).to(clean_images.device)
+                    bs = clean_images.shape[0]
 
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
-                ).long()
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device
+                    ).long()
 
-                noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-                #print(f"noisy_images: {noisy_images}")
+                    noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
-                with accelerator.accumulate(model):
-                    noise_pred = model(noisy_images, timestep=timesteps, return_dict=False)[0]
-                    #print(f"noise_pred: {noise_pred}")
-                    loss = F.mse_loss(noise_pred, noise)
-                    accelerator.backward(loss)
+                    with accelerator.accumulate(model):
+                        noise_pred = model(noisy_images, timestep=timesteps, return_dict=False)[0]
+                        loss = F.mse_loss(noise_pred, noise)
+                        accelerator.backward(loss)
 
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
+                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
 
-                step_time = time.time() - start_time
-                total_step_time += step_time
-                if step == 0:
-                    logger.debug(f"first_step_time: {step_time}")
-                progress_bar.update(1)
+                    step_time = time.time() - start_time
+                    total_step_time += step_time
+                    progress_bar.update(1)
 
-                logs = {
-                    "loss": loss.detach().item(),
-                    "lr": lr_scheduler.get_last_lr()[0],
-                    "step": global_step,
-                    "step_time": f"{step_time:.4f} seconds",
-                }
-                progress_bar.set_postfix(**logs)
-                accelerator.log(logs, step=global_step)
-                global_step += 1
+                    logs = {
+                        "loss": loss.detach().item(),
+                        "lr": lr_scheduler.get_last_lr()[0],
+                        "step": global_step,
+                        "step_time": f"{step_time:.4f} seconds",
+                    }
+                    progress_bar.set_postfix(**logs)
+                    accelerator.log(logs, step=global_step)
+                    global_step += 1
 
-            avg_step_time = total_step_time / len(train_dataloader)
-            logger.info(f"Epoch {epoch} - Average step time: {avg_step_time:.4f} seconds")
+                avg_step_time = total_step_time / len(train_dataloader)
+                logger.info(f"Epoch {epoch} - Average step time: {avg_step_time:.4f} seconds")
 
-            if config.eval:
-                logger.info("running eval")
-                if accelerator.is_main_process:
-                    pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
+                if config.eval:
+                    if accelerator.is_main_process:
+                        pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
 
-                    if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                        self.evaluate(epoch, pipeline)
+                        if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
+                            self.evaluate(epoch, pipeline)
 
-                    if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                        if config.push_to_hub:
-                            repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=True)
-                        else:
-                            pipeline.save_pretrained(config.output_dir)
+                        if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
+                            if config.push_to_hub:
+                                repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=True)
+                            else:
+                                pipeline.save_pretrained(config.output_dir)
+            
+            total_flops = flop_counter.get_total_flops()
+
+            # Estimate MFU
+            mfu = self.estimate_mfu(total_flops=total_flops, steps=global_step, avg_step_time=avg_step_time)
+            logger.info(f"MFU: {mfu:.4f}")
 
     def run(self) -> None:
         args = self.parse_args()
@@ -202,6 +216,10 @@ class DDPMPipelineTrainer:
 
         config.dataset_name = "huggan/smithsonian_butterflies_subset"
         dataset = load_dataset(config.dataset_name, split="train")
+        
+        # Limit dataset to 100 samples for faster training
+        dataset = dataset.select(range(100))
+        
         logger.debug(dataset)
 
         self.preprocess_dataset(dataset)
