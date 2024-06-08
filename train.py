@@ -4,9 +4,6 @@ import torch.nn.functional as F
 import argparse
 import time
 
-import torch._dynamo
-torch._dynamo.config.suppress_errors = True
-
 from dataclasses import dataclass
 from accelerate import Accelerator
 from huggingface_hub import HfFolder, Repository, whoami
@@ -19,7 +16,6 @@ from diffusers import DDPMPipeline, DDPMScheduler, Transformer2DModel
 from accelerate import notebook_launcher
 from typing import List, Dict, Optional
 from PIL import Image
-from rich import print
 from loguru import logger
 from functools import partial
 
@@ -156,7 +152,7 @@ class DDPMPipelineTrainer:
                 #print(f"noisy_images: {noisy_images}")
 
                 with accelerator.accumulate(model):
-                    noise_pred = model(noisy_images, timestep=timesteps, class_labels=None, return_dict=False)[0]
+                    noise_pred = model(noisy_images, timestep=timesteps, return_dict=False)[0]
                     #print(f"noise_pred: {noise_pred}")
                     loss = F.mse_loss(noise_pred, noise)
                     accelerator.backward(loss)
