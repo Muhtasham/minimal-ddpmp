@@ -113,7 +113,7 @@ class DDPMPipelineTrainer:
     def estimate_mfu(self, total_flops, steps, avg_step_time): 
         """ Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """ 
 
-        flops_per_iter = total_flops // steps
+        flops_per_iter = total_flops / steps
         
         # Express our flops throughput as ratio of A100 bfloat16 peak flops 
         flops_achieved = flops_per_iter * (1.0 / avg_step_time)  # per second 
