@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import argparse
 import time
 
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 from dataclasses import dataclass
 from accelerate import Accelerator
 from huggingface_hub import HfFolder, Repository, whoami
@@ -12,7 +15,7 @@ from pathlib import Path
 from torchvision import transforms
 from datasets import load_dataset
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from diffusers import DDPMPipeline, DDPMScheduler, Transformer2DModel
+from diffusers import DDPMPipeline, DDPMScheduler, Transformer2DModel, DiffusionPipeline
 from accelerate import notebook_launcher
 from typing import List, Dict, Optional
 from PIL import Image
@@ -33,12 +36,13 @@ class TrainingConfig:
     save_model_epochs: int = 30
     mixed_precision: str = "bf16"
     output_dir: str = "ddpm-butterflies-128"
-    push_to_hub: bool = False
+    push_to_hub: bool = True
     hub_private_repo: bool = False
     overwrite_output_dir: bool = True
     seed: int = 0
     eval: bool = False
     optim: bool = False
+    debug: bool = True
 
 class DDPMPipelineTrainer:
     def __init__(self, config: TrainingConfig):
@@ -57,12 +61,13 @@ class DDPMPipelineTrainer:
         parser.add_argument("--save_model_epochs", type=int, default=30, help="Save model every n epochs")
         parser.add_argument("--mixed_precision", type=str, default="fp16", help="Choose from no, fp16, bf16 or fp8")
         parser.add_argument("--output_dir", type=str, default="ddpm-butterflies-128", help="Output directory")
-        parser.add_argument("--push_to_hub", action='store_true', help="Upload the saved model to the HF Hub")
+        parser.add_argument("--push_to_hub", default=False, help="Upload the saved model to the HF Hub")
         parser.add_argument("--hub_private_repo", action='store_true', help="Make the HF Hub repo private")
         parser.add_argument("--overwrite_output_dir", action='store_true', help="Overwrite the old model")
         parser.add_argument("--seed", type=int, default=0, help="Random seed")
-        parser.add_argument("--eval", type=bool, default=False)
+        parser.add_argument("--eval", type=bool, default=True)
         parser.add_argument("--optim", type=bool, default=False)
+        parser.add_argument("--debug", type=bool, default=False)
 
         return parser.parse_args()
 
@@ -110,15 +115,12 @@ class DDPMPipelineTrainer:
         else:
             return f"{organization}/{model_id}"
 
-    def estimate_mfu(self, total_flops, steps, avg_step_time): 
-        """ Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """ 
-
+    def estimate_mfu(self, total_flops, steps, total_time_seconds):
+        """ Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         flops_per_iter = total_flops / steps
-        
-        # Express our flops throughput as ratio of A100 bfloat16 peak flops 
-        flops_achieved = flops_per_iter * (1.0 / avg_step_time)  # per second 
-        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS 
-        mfu = flops_achieved / flops_promised 
+        flops_achieved = flops_per_iter / total_time_seconds  # per second
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
         return mfu
 
     def train_loop(self, config: TrainingConfig, model: Transformer2DModel, noise_scheduler: DDPMScheduler, optimizer: torch.optim.Optimizer, train_dataloader: torch.utils.data.DataLoader, lr_scheduler) -> None:
@@ -131,6 +133,7 @@ class DDPMPipelineTrainer:
 
         if accelerator.is_main_process:
             if config.push_to_hub:
+                logger.info("Model will be pushed to HF Hub")
                 repo_name = self.get_full_repo_name(Path(config.output_dir).name)
                 repo = Repository(config.output_dir, clone_from=repo_name)
             elif config.output_dir is not None:
@@ -142,7 +145,7 @@ class DDPMPipelineTrainer:
         )
 
         global_step = 0
-        total_step_time = 0.0
+        total_training_time = 0.0
         flop_counter = FlopCounterMode(display=True)
 
         with flop_counter:
@@ -174,7 +177,7 @@ class DDPMPipelineTrainer:
                         optimizer.zero_grad()
 
                     step_time = time.time() - start_time
-                    total_step_time += step_time
+                    total_training_time += step_time
                     progress_bar.update(1)
 
                     logs = {
@@ -182,32 +185,29 @@ class DDPMPipelineTrainer:
                         "lr": lr_scheduler.get_last_lr()[0],
                         "step": global_step,
                         "step_time": f"{step_time:.4f} seconds",
+                        "flops": f"{flop_counter.get_total_flops():.4f} flops",
                     }
                     progress_bar.set_postfix(**logs)
                     accelerator.log(logs, step=global_step)
                     global_step += 1
 
-                avg_step_time = total_step_time / len(train_dataloader)
+                avg_step_time = total_training_time / len(train_dataloader)
                 logger.info(f"Epoch {epoch} - Average step time: {avg_step_time:.4f} seconds")
 
-                if config.eval:
-                    if accelerator.is_main_process:
-                        pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
-
-                        if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                            self.evaluate(epoch, pipeline)
-
-                        if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                            if config.push_to_hub:
-                                repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=True)
-                            else:
-                                pipeline.save_pretrained(config.output_dir)
             
             total_flops = flop_counter.get_total_flops()
 
             # Estimate MFU
-            mfu = self.estimate_mfu(total_flops=total_flops, steps=global_step, avg_step_time=avg_step_time)
+            mfu = self.estimate_mfu(total_flops=total_flops, steps=global_step, total_time_seconds=total_training_time)
             logger.info(f"MFU: {mfu:.4f}")
+            
+            model.save_pretrained(config.output_dir)
+            logger.info(f"Model saved to {config.output_dir}")
+            
+            # flash cuda memory
+            torch.cuda.empty_cache()
+            logger.info("Cuda cache flushed")
+            
 
     def run(self) -> None:
         args = self.parse_args()
@@ -217,15 +217,17 @@ class DDPMPipelineTrainer:
         config.dataset_name = "huggan/smithsonian_butterflies_subset"
         dataset = load_dataset(config.dataset_name, split="train")
         
-        # Limit dataset to 100 samples for faster training
-        dataset = dataset.select(range(100))
+        if config.debug:
+            # Limit dataset to 100 samples for faster training to debug
+            dataset = dataset.select(range(100))
         
-        logger.debug(dataset)
+        logger.debug(f"Dataset before preprocessing: {dataset}")
 
         self.preprocess_dataset(dataset)
-        logger.debug(dataset)
+        
+        logger.debug(f"Dataset after preprocessing: {dataset}")
 
-        train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
+        train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
         model = Transformer2DModel(
             num_attention_heads=16,
