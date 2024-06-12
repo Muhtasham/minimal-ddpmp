@@ -15,7 +15,7 @@ from pathlib import Path
 from torchvision import transforms
 from datasets import load_dataset
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from diffusers import DDPMPipeline, DDPMScheduler, Transformer2DModel, DiffusionPipeline
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, DiffusionPipeline
 from accelerate import notebook_launcher
 from typing import List, Dict, Optional
 from PIL import Image
@@ -229,17 +229,28 @@ class DDPMPipelineTrainer:
 
         train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-        model = Transformer2DModel(
-            num_attention_heads=16,
-            attention_head_dim=88,
-            in_channels=3,  # The number of channels in the input and output (e.g., 3 for RGB images)
-            num_layers=12,  # Number of layers of Transformer blocks to use
-            sample_size=config.image_size,  # The width of the latent images
-            patch_size=None,  # Disable patch size for this model to avoid NotImplementedError
-            dropout=0.1,
-            cross_attention_dim=None,  # No cross attention for unconditional generation
-            norm_num_groups=1,  # Set to 1 to avoid the ValueError
-            norm_type='layer_norm',  # Keep using layer norm
+        model = UNet2DModel(
+            sample_size=config.image_size,  # the target image resolution
+            in_channels=3,  # the number of input channels, 3 for RGB images
+            out_channels=3,  # the number of output channels
+            layers_per_block=2,  # how many ResNet layers to use per UNet block
+            block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
+            down_block_types=(
+                "DownBlock2D",  # a regular ResNet downsampling block
+                "DownBlock2D",
+                "DownBlock2D",
+                "DownBlock2D",
+                "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+                "DownBlock2D",
+            ),
+            up_block_types=(
+                "UpBlock2D",  # a regular ResNet upsampling block
+                "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+                "UpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
+            ),
         )
 
         if config.optim:
