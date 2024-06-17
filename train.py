@@ -115,15 +115,14 @@ class DDPMPipelineTrainer:
         else:
             return f"{organization}/{model_id}"
 
-    def estimate_mfu(self, total_flops, steps, total_time_seconds):
+    def estimate_mfu(self, total_flops, total_time_seconds):
         """ Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        flops_per_iter = total_flops / steps
-        flops_achieved = flops_per_iter / total_time_seconds  # per second
+        flops_achieved = total_flops / total_time_seconds  # FLOPs per second
         flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
-    def train_loop(self, config: TrainingConfig, model: Transformer2DModel, noise_scheduler: DDPMScheduler, optimizer: torch.optim.Optimizer, train_dataloader: torch.utils.data.DataLoader, lr_scheduler) -> None:
+    def train_loop(self, config: TrainingConfig, model: UNet2DModel, noise_scheduler: DDPMScheduler, optimizer: torch.optim.Optimizer, train_dataloader: torch.utils.data.DataLoader, lr_scheduler) -> None:
         accelerator = Accelerator(
             mixed_precision=config.mixed_precision,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -198,7 +197,7 @@ class DDPMPipelineTrainer:
             total_flops = flop_counter.get_total_flops()
 
             # Estimate MFU
-            mfu = self.estimate_mfu(total_flops=total_flops, steps=global_step, total_time_seconds=total_training_time)
+            mfu = self.estimate_mfu(total_flops=total_flops, total_time_seconds=total_training_time)
             logger.info(f"MFU: {mfu:.4f}")
             
             model.save_pretrained(config.output_dir)
@@ -253,6 +252,10 @@ class DDPMPipelineTrainer:
             ),
         )
 
+        # Count the number of parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"Total number of parameters: {total_params}")
+        
         if config.optim:
             start_compile_time = time.time()
             model = torch.compile(model)
